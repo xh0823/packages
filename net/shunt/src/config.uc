@@ -160,8 +160,10 @@ export function parse(sections) {
 
 		push(policies, {
 			name: s.name,
+			action: v.action,
 			interface: v.interface,
 			fallback: v.fallback,
+			keep_local: v.keep_local,
 			gw4: v.gw4,
 			gw6: v.gw6,
 			src: to_list(v.src),

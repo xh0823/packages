@@ -15,6 +15,11 @@ export const DEFAULTS = {
 	entry_ttl: 1200
 };
 
+// What a policy does with the traffic it selects. `route` marks it for its
+// own table, `bypass` only ends rule evaluation, so a later policy cannot
+// claim the same packet. Everything else is a configuration error.
+export const ACTIONS = { route: true, bypass: true };
+
 const RE_NAME = /^[A-Za-z0-9_]{1,24}$/;
 const RE_V4 = /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(\/([0-9]{1,2}))?$/;
 const RE_V6 = /^[0-9A-Fa-f:]{2,45}(\/([0-9]{1,3}))?$/;
@@ -104,6 +109,15 @@ export function addr_family(s) {
 	return null;
 };
 
+export function action_name(s) {
+	let v = lc(trim(`${s ?? ''}`));
+
+	if (!length(v))
+		return 'route';
+
+	return ACTIONS[v] ? v : null;
+};
+
 function mask_shift(mask) {
 	let n = 0;
 	while (n < 32 && !((mask >> n) & 1))
@@ -132,6 +146,14 @@ export function compile(policies, opts) {
 		if (!valid_name(pname)) {
 			reject(pname ?? `#${pi}`, null,
 				'invalid policy name - must match [A-Za-z0-9_]{1,24}');
+			continue;
+		}
+
+		let action = action_name(p.action);
+
+		if (action == null) {
+			reject(pname, p.action,
+				"invalid action - 'route' or 'bypass'");
 			continue;
 		}
 
@@ -216,14 +238,16 @@ export function compile(policies, opts) {
 			continue;
 		}
 
-		if (++idx > capacity) {
+		// A bypass policy owns no mark, no table and no rule - it only ends
+		// evaluation - so it costs nothing from the mark capacity.
+		if (action == 'route' && ++idx > capacity) {
 			reject(pname, null,
 				sprintf('mark capacity exceeded (%d policies fit in mask 0x%08x)',
 					capacity, mask));
 			continue;
 		}
 
-		let mark = idx << shift;
+		let mark = (action == 'route') ? idx << shift : null;
 		// One transport term for all three rule shapes. `th dport` reads the
 		// port at the transport header offset, which works for tcp and udp
 		// alike, so a port without a protocol needs no rule per protocol.
@@ -239,11 +263,24 @@ export function compile(policies, opts) {
 				? sprintf('th dport %s ', ports[0])
 				: sprintf('th dport { %s } ', join(', ', ports));
 
-		let stmt = sprintf('%smeta mark set (meta mark & 0x%08x) | 0x%08x counter return',
-			l4, ~mask & 0xffffffff, mark);
+		// bypass keeps whatever mark the packet carries: no shunt rule after
+		// this one is reached, and the bits outside the mask are not ours.
+		let stmt = (action == 'bypass')
+			? sprintf('%scounter return', l4)
+			: sprintf('%smeta mark set (meta mark & 0x%08x) | 0x%08x counter return',
+				l4, ~mask & 0xffffffff, mark);
 
-		push(marks, { name: pname, index: idx, mark,
-			rt_table: 8000 + idx, rt_prio: 31000 + idx });
+		// Two rule priorities per routing policy, in two bands 500 apart:
+		// keep_local's main lookup keeps the band a released version already
+		// used, so an upgrade removes the old rule with the new one's del,
+		// and the policy table rule moves up out of the way.
+		push(marks, (action == 'bypass')
+			? { name: pname, action, index: null, mark: null,
+				rt_table: null, rt_prio: null, rt_prio_local: null }
+			: { name: pname, action, index: idx, mark,
+				rt_table: 8000 + idx,
+				rt_prio: 31500 + idx,
+				rt_prio_local: 31000 + idx });
 
 		if (has_mac)
 			push(sets, sprintf(

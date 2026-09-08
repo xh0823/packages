@@ -33,9 +33,15 @@ export function create(entry_ttl) {
 		return n;
 	}
 
+	// Dropped wholesale when the table had to be re-created: the kernel has
+	// no elements any more, so every pair is due again regardless of age.
+	function reset() {
+		last = {};
+	}
+
 	function size() {
 		return length(keys(last));
 	}
 
-	return { due, prune, size };
+	return { due, prune, reset, size };
 };

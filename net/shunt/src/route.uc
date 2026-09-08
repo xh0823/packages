@@ -12,6 +12,20 @@ const RE_IFACE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$/;
 
 const BLACKHOLE_METRIC = 9999;
 
+// Policy options arrive as UCI strings - config.uc only collects them - so the
+// one boolean among them is read here, with the rest of the routing checks.
+function to_bool(v, dflt) {
+	if (v == null || v == '')
+		return dflt;
+	if (v === true || v === false)
+		return v;
+	if (v == '1' || v == 1)
+		return true;
+	if (v == '0' || v == 0)
+		return false;
+	return null;
+}
+
 export function compile(policies, marks, opts) {
 	let mask = opts?.mask ?? DEFAULTS.mask;
 	let add = [], del = [], tables = [], issues = [];
@@ -27,6 +41,11 @@ export function compile(policies, marks, opts) {
 	for (let p in (policies ?? [])) {
 		let m = by_name[p?.name];
 		if (!m)
+			continue;
+
+		// A bypass policy has no mark, so it has no table and no rule; the
+		// nft chain returning is the whole of it. `interface` is not read.
+		if (m.action == 'bypass')
 			continue;
 
 		let iface = p.interface;
@@ -59,9 +78,17 @@ export function compile(policies, marks, opts) {
 		if (gw_bad)
 			continue;
 
+		let keep = to_bool(p.keep_local, true);
+
+		if (keep === null) {
+			reject(p.name, p.keep_local, 'keep_local must be 0 or 1, default kept');
+			keep = true;
+		}
+
 		let fwmark = sprintf('0x%x/0x%x', m.mark, mask);
 		let table = sprintf('%d', m.rt_table);
 		let pref = sprintf('%d', m.rt_prio);
+		let pref_local = sprintf('%d', m.rt_prio_local);
 
 		push(tables, sprintf('%d\tshunt_%s', m.rt_table, m.name));
 
@@ -80,11 +107,24 @@ export function compile(policies, marks, opts) {
 					sprintf('%d', BLACKHOLE_METRIC),
 					'table', table ]);
 
+			// Ahead of the policy rule and on the same mark: main is
+			// consulted with its default route suppressed, so marked traffic
+			// to anything main has a specific route for - every attached
+			// subnet, every static route - keeps taking it, and only what
+			// would have used the default route reaches the policy table.
+			if (keep)
+				push(add, [ 'ip', v, 'rule', 'add', 'pref', pref_local,
+					'fwmark', fwmark, 'lookup', 'main',
+					'suppress_prefixlength', '0' ]);
+
 			push(add, [ 'ip', v, 'rule', 'add', 'pref', pref,
 				'fwmark', fwmark, 'lookup', table ]);
 
 			unshift(del, [ 'ip', v, 'route', 'flush', 'table', table ]);
 			unshift(del, [ 'ip', v, 'rule', 'del', 'pref', pref ]);
+			// Deleted whether or not it is rendered now: keep_local may have
+			// been on when the running ruleset was applied.
+			unshift(del, [ 'ip', v, 'rule', 'del', 'pref', pref_local ]);
 		}
 	}
 

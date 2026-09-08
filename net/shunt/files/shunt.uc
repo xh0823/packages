@@ -13,7 +13,7 @@ import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_ERR, LOG_WARNING,
 	LOG_NOTICE, LOG_INFO, LOG_DEBUG } from 'log';
 import { load as cfg_load, parse as cfg_parse } from 'shunt.config';
 import { compile as match_compile } from 'shunt.match';
-import { compile as nft_compile, refresh, teardown } from 'shunt.nft';
+import { action_name, compile as nft_compile, refresh, teardown, TABLE } from 'shunt.nft';
 import { compile as route_compile } from 'shunt.route';
 import { open as snoop_open, observe, RECV_LEN } from 'shunt.snoop';
 import { names as poll_names, plan as poll_plan,
@@ -143,6 +143,34 @@ function nft_pipe(batch, what) {
 	return true;
 }
 
+// shunt's table check
+function table_present() {
+	return quiet([ 'nft', '-t', 'list', 'table', ...split(TABLE, ' ') ]) == 0;
+}
+
+// Re-creates the table if it went away
+function ensure_table(st) {
+	if (table_present()) {
+		st.lost = false;
+		return 'ok';
+	}
+
+	if (!st.lost) {
+		st.lost = true;
+		log('warn', 'ruleset gone from the kernel - re-applying; `fw4 flush`, as run by `/etc/init.d/firewall stop`, deletes every nftables table');
+	}
+
+	if (!nft_pipe(st.state.nft.setup, 'setup'))
+		return 'failed';
+
+	st.lost = false;
+	st.stats.reapplied++;
+	st.cache.reset();
+	log('notice', 'ruleset re-applied - learned addresses refill from the next poll cycle and from snoop');
+
+	return 'recreated';
+}
+
 function apply(state) {
 	if (!nft_pipe(state.nft.setup, 'setup'))
 		return false;
@@ -203,6 +231,10 @@ function policy_devices(policies) {
 
 	for (let p in (policies ?? [])) {
 		let dev = p.interface;
+
+		// bypass policies route into nothing - rp_filter does not apply.
+		if (action_name(p.action) != 'route')
+			continue;
 
 		if (length(dev ?? '') && !seen[dev]) {
 			seen[dev] = true;
@@ -319,6 +351,9 @@ function drain_writes(st) {
 
 	if (ok)
 		debug(sprintf('%d element(s) written in %ds', length(due), cost));
+	else if (ensure_table(st) == 'recreated')
+		for (let w in due)
+			st.pending[`${w.set}/${w.addr}`] = w;
 
 	let want = cost * WRITE_FACTOR;
 
@@ -377,7 +412,7 @@ function run() {
 	let targets = poll_names(state.cfg.policies);
 
 	let stats = { started: time(), resolv: false, snoop: [],
-		matched: 0, drops: {} };
+		matched: 0, drops: {}, reapplied: 0 };
 
 	try {
 		resolv = require('resolv');
@@ -392,7 +427,8 @@ function run() {
 
 	let unresolved = {};
 
-	let wq = { state, cache, pending: {}, interval: WRITE_MIN, timer: null };
+	let wq = { state, cache, stats, pending: {}, lost: false,
+		interval: WRITE_MIN, timer: null };
 
 	function poll_cycle() {
 		if (!resolv || !length(targets))
@@ -435,6 +471,8 @@ function run() {
 	function tick() {
 		for (let argv in state.route.add)
 			quiet(argv);
+
+		ensure_table(wq);
 
 		poll_cycle();
 		cache.prune(time());
@@ -514,6 +552,7 @@ function run() {
 					matched: stats.matched,
 					drops: stats.drops
 				},
+				reapplied: stats.reapplied,
 				dedupe: cache.size()
 			};
 		}
@@ -611,9 +650,14 @@ function check() {
 	printf('policies: %d accepted, %d mark(s)\n',
 		length(state.cfg.policies), length(state.nft.marks));
 
+	// A bypass policy has none of the three - printing them would render
+	// its nulls as a mark of 0 in table 0.
 	for (let m in state.nft.marks)
-		printf('  %-16s mark 0x%08x  table %d  pref %d\n',
-			m.name, m.mark, m.rt_table, m.rt_prio);
+		if (m.action == 'bypass')
+			printf('  %-16s bypass\n', m.name);
+		else
+			printf('  %-16s mark 0x%08x  table %d  pref %d\n',
+				m.name, m.mark, m.rt_table, m.rt_prio);
 
 	let total = length(state.matcher.issues) + length(state.nft.issues) +
 		length(state.route.issues);
